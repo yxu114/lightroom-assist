@@ -1,0 +1,4 @@
+numpy==2.5.3
+opencv-python-headless==5.0.0.93
+tifffile==2026.9.20
+imagecodecs==2026.8.16

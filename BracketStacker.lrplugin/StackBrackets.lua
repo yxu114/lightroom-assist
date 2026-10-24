@@ -1,0 +1,1 @@
+require('BracketStacker').run('stack')
