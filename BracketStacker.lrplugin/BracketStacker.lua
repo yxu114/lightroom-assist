@@ -63,14 +63,6 @@ local function sendShortcut(name)
 	return LrTasks.execute(cmd)
 end
 
-local function setLabel(catalog, photos, colour, actionName)
-	catalog:withWriteAccessDo(actionName, function()
-		for _, photo in ipairs(photos) do
-			photo:setRawMetadata('colorNameForLabel', colour)
-		end
-	end, { timeout = 30 })
-end
-
 -- The folders holding the source photos, and every photo already in them, so
 -- that merged DNGs can be recognised as the new arrivals.
 local function snapshotFolders(catalog, groups)
@@ -106,19 +98,45 @@ local function activeCollection(catalog)
 	return nil
 end
 
--- HDR merges run in the background, so keep checking the source folders for new
--- DNGs. Each one is labelled and, when working from a collection, added to it so
--- it shows up next to its sources. Stops once every merge has arrived, after
--- MERGE_TIMEOUT seconds with nothing new, or when cancelled.
-local function waitForMerges(catalog, folders, existing, expected, options, progress)
-	local collection = activeCollection(catalog)
-	local arrived, lastArrival = 0, LrDate.currentTime()
+local function escapePattern(s)
+	return (s:gsub('[%^%$%(%)%%%.%[%]%*%+%-%?]', '%%%0'))
+end
 
-	while arrived < expected do
+-- Lightroom names a merged HDR after the set's first frame plus -HDR (then -2,
+-- -3... if that name is taken), as a DNG. Returns the set the DNG belongs to.
+local function matchMergedSet(fileName, pending)
+	local name = (fileName or ''):lower()
+	if not name:find('%.dng$') then
+		return nil
+	end
+	for index, prefix in pairs(pending) do
+		if name:find('^' .. prefix .. '%-hdr') then
+			return index
+		end
+	end
+	return nil
+end
+
+-- HDR merges run in the background, so keep checking the source folders for new
+-- DNGs named after a merged set. When working from a collection each one is
+-- added to it so it shows up next to its sources. Stops once every set has its
+-- DNG, after MERGE_TIMEOUT seconds with nothing new, or when cancelled.
+-- Returns the merged DNGs and the sets still missing one. Nothing is labelled
+-- here: labels are written once all merges are in.
+local function waitForMerges(catalog, folders, existing, groups, fmt, progress)
+	local collection = activeCollection(catalog)
+	local pending = {}
+	for index, group in ipairs(groups) do
+		local base = LrPathUtils.removeExtension(fmt[group[1]].fileName or '')
+		pending[index] = escapePattern(base:lower())
+	end
+
+	local merged, lastArrival = {}, LrDate.currentTime()
+	while #merged < #groups do
 		if progress:isCanceled() or LrDate.currentTime() - lastArrival > MERGE_TIMEOUT then
 			break
 		end
-		progress:setCaption(string.format('Waiting for HDR merges: %d of %d done', arrived, expected))
+		progress:setCaption(string.format('Waiting for HDR merges: %d of %d done', #merged, #groups))
 		LrTasks.sleep(MERGE_POLL_INTERVAL)
 
 		local candidates = {}
@@ -131,33 +149,36 @@ local function waitForMerges(catalog, folders, existing, expected, options, prog
 		end
 
 		if #candidates > 0 then
-			local raw = catalog:batchGetRawMetadata(candidates, { 'fileFormat' })
-			local merged = {}
+			local names = catalog:batchGetFormattedMetadata(candidates, { 'fileName' })
+			local found = {}
 			for _, photo in ipairs(candidates) do
 				existing[photo.localIdentifier] = true
-				if raw[photo].fileFormat == 'DNG' then
+				local index = matchMergedSet(names[photo].fileName, pending)
+				if index then
+					pending[index] = nil
+					found[#found + 1] = photo
 					merged[#merged + 1] = photo
 				end
 			end
 
-			if #merged > 0 then
-				catalog:withWriteAccessDo('Label HDR merges', function()
-					if options.labelMerged then
-						for _, photo in ipairs(merged) do
-							photo:setRawMetadata('colorNameForLabel', 'blue')
-						end
-					end
-					if collection then
-						collection:addPhotos(merged)
-					end
-				end, { timeout = 30 })
-				arrived = arrived + #merged
+			if #found > 0 then
+				if collection then
+					catalog:withWriteAccessDo('Add HDR merges to collection', function()
+						collection:addPhotos(found)
+					end, { timeout = 30 })
+				end
 				lastArrival = LrDate.currentTime()
-				progress:setPortionComplete(arrived, expected)
+				progress:setPortionComplete(#merged, #groups)
 			end
 		end
 	end
-	return arrived
+
+	local missing = {}
+	for index in pairs(pending) do
+		missing[#missing + 1] = index
+	end
+	table.sort(missing)
+	return merged, missing
 end
 
 local function sortPhotos(catalog, photos, sortBy)
@@ -309,18 +330,23 @@ end
 -- Bracket values come from Canon's maker notes when ExifTool is available,
 -- otherwise from the EXIF exposure compensation. Frames that don't fit a full
 -- set are left out, so single exposures and broken brackets never get stacked.
--- Returns sets and unmatched runs, or nil, nil and a photo with no bracket value.
+-- Returns sets, unmatched runs and, when the maker notes say which frames were
+-- shot in AEB, the set of those frames (otherwise nil). Returns nil, nil and a
+-- photo with no bracket value if sets can't be found by exposure.
 local function makeGroupsByExposure(catalog, photos, order, size, step)
 	local raw = catalog:batchGetRawMetadata(photos,
 		{ 'exposureBias', 'dateTimeOriginal', 'shutterSpeed' })
 	local makerNotes = readMakerNoteBrackets(catalog, photos)
 
+	local aebFrames
 	for _, photo in ipairs(photos) do
 		local frame = raw[photo]
 		local note = makerNotes and makerNotes[photo]
 		if note and note.value then
 			frame.bracket = note.value
 			frame.bracketed = note.mode ~= 'Off'
+			aebFrames = aebFrames or {}
+			aebFrames[photo] = frame.bracketed or nil
 		else
 			frame.bracket = frame.exposureBias
 			frame.bracketed = true
@@ -373,7 +399,7 @@ local function makeGroupsByExposure(catalog, photos, order, size, step)
 	if #run > 0 then
 		unmatched[#unmatched + 1] = run
 	end
-	return groups, unmatched
+	return groups, unmatched, nil, aebFrames
 end
 
 -- A bracket set should have a different exposure compensation on every frame.
@@ -562,11 +588,11 @@ local function findGroupsByCount(catalog, sorted, fmt, options)
 		end
 	end
 
-	return groups
+	return groups, leftover
 end
 
 local function findGroupsByExposure(catalog, sorted, fmt, options)
-	local sets, unmatched, missing = makeGroupsByExposure(
+	local sets, unmatched, missing, aebFrames = makeGroupsByExposure(
 		catalog, sorted, options.findBy, options.groupSize, options.step)
 	if not sets then
 		LrDialogs.message('Stack Brackets',
@@ -575,32 +601,47 @@ local function findGroupsByExposure(catalog, sorted, fmt, options)
 		return nil
 	end
 
-	-- A lone unmatched photo is most likely a single exposure, so just count it.
-	-- Two or more unmatched in a row is more likely a broken bracket worth checking.
-	local suspects, singles = {}, 0
+	-- When the maker notes say which frames were shot in AEB, only AEB frames left
+	-- out of a set are worth checking: they're a broken bracket. Frames shot with
+	-- AEB off are single exposures. Without maker notes, a lone unmatched photo is
+	-- most likely a single, and two or more in a row may be a broken bracket.
+	local suspects, unstacked = {}, 0
 	for _, run in ipairs(unmatched) do
-		if #run == 1 then
-			singles = singles + 1
-		else
+		unstacked = unstacked + #run
+		if aebFrames then
+			local frames = {}
+			for _, photo in ipairs(run) do
+				if aebFrames[photo] then
+					frames[#frames + 1] = photo
+				end
+			end
+			if #frames == 1 then
+				suspects[#suspects + 1] = string.format('%s (1 of %d frames)',
+					fmt[frames[1]].fileName, options.groupSize)
+			elseif #frames > 1 then
+				suspects[#suspects + 1] = string.format('%s ... %s (%d of %d frames)',
+					fmt[frames[1]].fileName, fmt[frames[#frames]].fileName, #frames, options.groupSize)
+			end
+		elseif #run > 1 then
 			suspects[#suspects + 1] = string.format('%s ... %s (%d photos)',
 				fmt[run[1]].fileName, fmt[run[#run]].fileName, #run)
 		end
 	end
 
-	local singlesNote = ''
-	if singles > 0 then
-		singlesNote = string.format('\n\n%d single photo(s) will also be left unstacked.', singles)
+	-- Ask only when a bracket can't be stacked; otherwise the summary says it all.
+	if #suspects > 0 then
+		local missingLine = aebFrames
+			and string.format('%d incomplete bracket(s), not stacked:', #suspects)
+			or string.format('%d run(s) that may be broken brackets, not stacked:', #suspects)
+		local intro = string.format('%d stack(s)\n%d photo(s) not in a stack\n%s',
+			#sets, unstacked, missingLine)
+		if not confirmWithList('Some brackets can\'t be stacked', intro, suspects,
+				string.format('Stack the %d complete set(s)?', #sets), 'Stack') then
+			return nil
+		end
 	end
 
-	if #suspects > 0 and not confirmWithList(
-			string.format('%d run(s) of photos don\'t match the bracket pattern', #suspects),
-			'These will be left unstacked. They may be broken brackets or several singles in a row:',
-			suspects,
-			string.format('Continue with the %d matching sets?%s', #sets, singlesNote), 'Continue') then
-		return nil
-	end
-
-	return sets, singles
+	return sets, unstacked, suspects, aebFrames ~= nil
 end
 
 -- Every photo in the active folders/collections, including ones hidden inside
@@ -721,11 +762,11 @@ local function runStack(context, catalog)
 
 	local sorted, fmt = sortPhotos(catalog, photos, options.sortBy)
 
-	local groups, singles
+	local groups, incomplete, byAeb
 	if options.findBy == 'count' then
 		groups = findGroupsByCount(catalog, sorted, fmt, options)
 	else
-		groups, singles = findGroupsByExposure(catalog, sorted, fmt, options)
+		groups, _, incomplete, byAeb = findGroupsByExposure(catalog, sorted, fmt, options)
 	end
 	if not groups then
 		return
@@ -759,7 +800,7 @@ local function runStack(context, catalog)
 		return #catalog:getTargetPhotos() == #group
 	end
 
-	local stacked, stackedPhotos, failure = 0, {}, nil
+	local done, failure = {}, nil
 	for i, group in ipairs(groups) do
 		if progress:isCanceled() then
 			break
@@ -784,34 +825,108 @@ local function runStack(context, catalog)
 		sendShortcut('stack')
 		LrTasks.sleep(options.delay)
 
-		stacked = stacked + 1
-		for _, photo in ipairs(group) do
-			stackedPhotos[#stackedPhotos + 1] = photo
-		end
+		done[#done + 1] = group
 		progress:setPortionComplete(i, #groups)
 	end
 
-	if options.labelStacked and #stackedPhotos > 0 then
-		setLabel(catalog, stackedPhotos, 'yellow', 'Label bracket stacks')
+	-- Labels are written only once every merge is in. A merged DNG copies its
+	-- source's label, so labelling the sources earlier would turn late DNGs Yellow.
+	local merged, missing
+	if options.merge and #done > 0 and not progress:isCanceled() then
+		progress:setPortionComplete(0, #done)
+		merged, missing = waitForMerges(catalog, folders, existing, done, fmt, progress)
 	end
 
-	local merged
-	if options.merge and stacked > 0 and not progress:isCanceled() then
-		progress:setPortionComplete(0, stacked)
-		merged = waitForMerges(catalog, folders, existing, stacked, options, progress)
+	-- Cancelled before the merges were in: labelling now would turn late DNGs
+	-- Yellow, so leave labelling to Label Brackets.
+	local skipLabels = options.merge and #done > 0 and not merged
+
+	-- Every photo in a set that was stacked. Lightroom doesn't save a stack made
+	-- by Ctrl+G straight away, so the SDK can't confirm it yet: isInStackInFolder
+	-- still reads false for a while.
+	local inStack, yellow = 0, {}
+	for _, group in ipairs(done) do
+		inStack = inStack + #group
+		if options.labelStacked and not skipLabels then
+			for _, photo in ipairs(group) do
+				yellow[#yellow + 1] = photo
+			end
+		end
+	end
+	local blue = (merged and options.labelMerged) and merged or {}
+
+	if #yellow > 0 or #blue > 0 then
+		progress:setCaption('Labelling')
+		catalog:withWriteAccessDo('Label bracket stacks', function()
+			for _, photo in ipairs(yellow) do
+				photo:setRawMetadata('colorNameForLabel', 'yellow')
+			end
+			for _, photo in ipairs(blue) do
+				photo:setRawMetadata('colorNameForLabel', 'blue')
+			end
+		end, { timeout = 30 })
 	end
 
 	progress:done()
 
-	local summary = string.format('%d of %d stacks created.', stacked, #groups)
-	if singles and singles > 0 then
-		summary = summary .. string.format('\n%d single photo(s) left unstacked.', singles)
+	-- The three things that matter first: stacks made, photos left out, and any
+	-- brackets that should have been a stack but aren't.
+	local summary = string.format('%d stack(s) created', #done)
+	if #done < #groups then
+		summary = summary .. string.format(' of %d sets found', #groups)
+	end
+	summary = summary .. string.format('\n%d photo(s) not in a stack', #sorted - inStack)
+
+	local missingLines = {}
+	local function addMissing(heading, names)
+		if #names == 0 then
+			return
+		end
+		missingLines[#missingLines + 1] = heading
+		for i = 1, math.min(#names, MAX_LISTED_PROBLEMS) do
+			missingLines[#missingLines + 1] = '    ' .. names[i]
+		end
+		if #names > MAX_LISTED_PROBLEMS then
+			missingLines[#missingLines + 1] = string.format('    ...and %d more', #names - MAX_LISTED_PROBLEMS)
+		end
+	end
+	if incomplete then
+		addMissing(string.format(byAeb and '%d incomplete bracket(s), not stacked:'
+			or '%d run(s) that may be broken brackets, not stacked:', #incomplete), incomplete)
+	end
+	local notReached = {}
+	for i = #done + 1, #groups do
+		notReached[#notReached + 1] = fmt[groups[i][1]].fileName
+	end
+	addMissing(string.format('%d set(s) not reached:', #notReached), notReached)
+	if #missingLines > 0 then
+		summary = summary .. '\n' .. table.concat(missingLines, '\n')
+	elseif incomplete then
+		summary = summary .. '\nNo missing stacks'
+	end
+	summary = summary .. '\n'
+
+	if skipLabels and (options.labelStacked or options.labelMerged) then
+		summary = summary .. '\nNothing was labelled because the run was cancelled. '
+			.. 'Run Label Brackets once the merges are done.'
+	elseif options.labelStacked then
+		summary = summary .. string.format('\n%d photo(s) labelled Yellow.', #yellow)
 	end
 	if merged then
-		summary = summary .. string.format('\n%d of %d HDR merges found%s.', merged, stacked,
+		summary = summary .. string.format('\n%d of %d HDR merges found%s.', #merged, #done,
 			options.labelMerged and ' and labelled Blue' or '')
-		if merged < stacked then
-			summary = summary .. '\nAny still running will finish in the background, but won\'t be labelled.'
+		if #missing > 0 then
+			local names = {}
+			for i = 1, math.min(#missing, MAX_LISTED_PROBLEMS) do
+				names[i] = fmt[done[missing[i]][1]].fileName
+			end
+			if #missing > MAX_LISTED_PROBLEMS then
+				names[#names + 1] = string.format('...and %d more', #missing - MAX_LISTED_PROBLEMS)
+			end
+			summary = summary .. '\n\nNo merge found yet for the sets starting at:\n'
+				.. table.concat(names, '\n')
+				.. '\n\nAny still running will finish in the background. '
+				.. 'Run Label Brackets once they\'re done to label them.'
 		end
 	end
 

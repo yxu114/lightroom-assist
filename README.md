@@ -63,10 +63,12 @@ Restart Lightroom Classic. If you used the Modules folder, the plugins are alrea
 
 Options
 
-- **Label bracket photos Yellow**
+- **Label bracket photos Yellow** labels every photo in each stacked set. Labels are added at the very end, after the merges are in, because a merged DNG copies its source's label.
 - **HDR merge each set** sends Lightroom's HDR merge shortcut, which reuses your last merge settings without a dialog. Run one HDR merge by hand first with the settings you want.
-- **Label merged DNGs Blue** waits for the merges to finish, labels each new DNG and adds it to the collection you're in. It gives up after 5 minutes without a new DNG.
+- **Label merged DNGs Blue** waits for the merges to finish, matching each new DNG to its set by name, the set's first frame plus `-HDR`. It labels each one and adds it to the collection you're in. It gives up after 5 minutes without a new DNG and lists any sets still waiting, so you can run Label Brackets once they're done. If you cancel while merges are running, nothing is labelled.
 - **Pause per stack** raise this if some sets get skipped on a slower computer.
+
+When it finishes, the summary gives the number of stacks made, the number of photos not in a stack, and any brackets that couldn't be stacked.
 
 ### Label Brackets
 
@@ -78,7 +80,7 @@ For sets you've already stacked or merged. Every stacked photo is labelled Yello
 
 Photos are ordered by capture time, then file name, or by file name alone.
 
-- **Exposure order**, such as `− 0 +` with 2 stops between frames. A set is a run of frames whose exposures follow the pattern exactly, whatever the base exposure. Each frame must also start soon after the one before it, within twice that frame's shutter time plus 5 seconds. Anything that doesn't make a full set is left alone and listed, so you can check it.
+- **Exposure order**, such as `− 0 +` with 2 stops between frames. A set is a run of frames whose exposures follow the pattern exactly, whatever the base exposure. Each frame must also start soon after the one before it, within twice that frame's shutter time plus 5 seconds. Anything that doesn't make a full set is left alone and counted as not in a stack. When ExifTool can read a Canon camera's maker notes, only bracketed frames that don't make a full set are listed for checking, and frames shot without bracketing count as single shots. Otherwise, runs of 2 or more unmatched photos are listed.
 - **Fixed count** every N photos is a set. It warns if the count doesn't divide evenly or a set repeats an exposure.
 
 Canon cameras shooting auto exposure bracketing in Manual mode record the bracket offset only in their maker notes, which Lightroom can't read. ExifTool reads them, without changing your files.
@@ -92,7 +94,7 @@ Lightroom's plugin SDK can't create stacks or HDR merges. So for each set the pl
 **Library > Plug-in Extras > Place Upright Guides...**, or in Develop, **File > Plug-in Extras > Place Upright Guides...**
 
 1. Select the photos.
-2. Choose the options and click **Place Guides**. It takes about 2 seconds a photo.
+2. Choose the options and click **Place Guides**. It takes about 2 seconds a photo to measure, then a few seconds a photo in Develop. Keep Lightroom in front and leave the keyboard and mouse alone until it finishes.
 
 Options
 
@@ -101,7 +103,9 @@ Options
 
 The summary lists each photo's measured pitch and roll. Photos marked **low confidence** have few or short vertical edges, so check those first.
 
-Only develop settings change, Upright, the guides, and lens correction if ticked, as one history step you can undo. Your image files are only read.
+Lightroom only works out a Guided Upright correction when the Upright mode is changed in Develop. So after placing the guides, the plugin opens each photo in Develop and switches Upright to Auto and back to Guided, as you would by hand, then returns you to where you started.
+
+Only develop settings change, Upright, the guides, and lens correction if ticked, and each step can be undone from History. Your image files are only read.
 
 ## Troubleshooting
 
