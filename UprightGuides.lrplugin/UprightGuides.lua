@@ -13,7 +13,10 @@ through the SDK, and can be undone from History.
 ]]
 
 local LrApplication = import 'LrApplication'
+local LrApplicationView = import 'LrApplicationView'
 local LrBinding = import 'LrBinding'
+local LrDate = import 'LrDate'
+local LrDevelopController = import 'LrDevelopController'
 local LrDialogs = import 'LrDialogs'
 local LrFileUtils = import 'LrFileUtils'
 local LrFunctionContext = import 'LrFunctionContext'
@@ -31,6 +34,16 @@ local MAX_LISTED = 12
 -- Upright version Lightroom writes alongside guides; used when a photo has
 -- never had Upright set, so Lightroom reads the guides with the current model.
 local UPRIGHT_VERSION = 151388160
+
+-- PerspectiveUpright values.
+local UPRIGHT_AUTO = 1
+local UPRIGHT_GUIDED = 5
+
+-- Seconds to wait for Develop to load a photo, to let it settle before the
+-- first change, and for Lightroom to save each mode change.
+local LOAD_TIMEOUT = 5
+local LOAD_SETTLE = 1
+local SOLVE_TIMEOUT = 10
 
 -- The helper lives in helper/ inside this plugin, with its own Python in helper/.venv.
 local function helperPaths()
@@ -62,6 +75,93 @@ local function splitTabs(line)
 		out[#out + 1] = field
 	end
 	return out
+end
+
+local function waitFor(seconds, done)
+	local deadline = LrDate.currentTime() + seconds
+	while not done() do
+		if LrDate.currentTime() > deadline then
+			return false
+		end
+		LrTasks.sleep(0.1)
+	end
+	return true
+end
+
+-- Sets the Upright mode on the photo open in Develop and waits until Lightroom
+-- has saved it, trying once more if it doesn't take. Returns true once saved,
+-- false if it never was, or nil and a message if Develop refused the change.
+local function setUpright(photo, mode)
+	for _ = 1, 2 do
+		local ok, result, message = pcall(LrDevelopController.setValue, 'PerspectiveUpright', mode)
+		if not ok or result == false then
+			return nil, tostring(ok and message or result)
+		end
+		if waitFor(SOLVE_TIMEOUT, function()
+				return (photo:getDevelopSettings() or {}).PerspectiveUpright == mode
+			end) then
+			return true
+		end
+	end
+	return false
+end
+
+-- Lightroom stores the solved correction (UprightTransform_0 to _5, one per
+-- mode) only when the Upright mode is changed in Develop; guides written
+-- through the SDK alone leave it unsolved. So each photo is opened in Develop
+-- and switched to Auto and back to Guided, as you would by hand. Each change is
+-- only made once the one before it has been saved: Guided sent while Auto is
+-- still solving gets overwritten by Auto. Returns how many were solved, and an
+-- error message if Develop refused the change.
+local function solveInDevelop(catalog, photos, progress)
+	local startModule = LrApplicationView.getCurrentModuleName()
+	local active = catalog:getTargetPhoto()
+	local selection = catalog:getTargetPhotos()
+
+	LrApplicationView.switchToModule('develop')
+	local solved, failure = 0, nil
+	for i, photo in ipairs(photos) do
+		if progress:isCanceled() then
+			break
+		end
+		progress:setCaption(string.format('Applying correction %d of %d', i, #photos))
+		catalog:setSelectedPhotos(photo, {})
+		waitFor(LOAD_TIMEOUT, function()
+			return catalog:getTargetPhoto() == photo
+		end)
+		LrTasks.sleep(LOAD_SETTLE)
+
+		-- Lightroom saves the mode change together with its solve, so the saved
+		-- mode is enough to know the step finished. The solved transforms can't be
+		-- checked directly: on Guided Lightroom keeps only some of them.
+		local auto, message = setUpright(photo, UPRIGHT_AUTO)
+		local guided
+		if auto then
+			guided, message = setUpright(photo, UPRIGHT_GUIDED)
+		end
+		if auto == nil or guided == nil and message then
+			failure = message
+			break
+		end
+		if guided then
+			solved = solved + 1
+		end
+		progress:setPortionComplete(i, #photos)
+	end
+
+	if active then
+		local others = {}
+		for _, photo in ipairs(selection) do
+			if photo ~= active then
+				others[#others + 1] = photo
+			end
+		end
+		catalog:setSelectedPhotos(active, others)
+	end
+	if startModule and startModule ~= 'develop' then
+		LrApplicationView.switchToModule(startModule)
+	end
+	return solved, failure
 end
 
 local function showOptions(context, count)
@@ -167,7 +267,7 @@ local function main(context)
 	end
 
 	progress:setCaption('Writing guides')
-	local placed, lines = 0, {}
+	local placed, lines, placedPhotos = 0, {}, {}
 	catalog:withWriteAccessDo('Place Upright guides', function()
 		for _, r in ipairs(results) do
 			local photo = byId[r[1]]
@@ -193,6 +293,7 @@ local function main(context)
 				end
 				photo:applyDevelopSettings(settings, 'Upright guides')
 				placed = placed + 1
+				placedPhotos[#placedPhotos + 1] = photo
 
 				local note = (r[7] or '') ~= '' and ('  (' .. r[7] .. ')') or ''
 				lines[#lines + 1] = string.format('%s: pitch %+.1f\194\176, roll %+.1f\194\176%s',
@@ -202,6 +303,19 @@ local function main(context)
 			end
 		end
 	end, { timeout = 60 })
+
+	local solveNote = ''
+	if #placedPhotos > 0 then
+		progress:setPortionComplete(0, #placedPhotos)
+		local solved, failure = solveInDevelop(catalog, placedPhotos, progress)
+		if failure then
+			solveNote = string.format('\n\nLightroom refused the Upright mode change (%s), so the correction '
+				.. 'isn\'t applied yet. Switch Upright to Auto and back to Guided to apply it.', failure)
+		elseif solved < #placedPhotos then
+			solveNote = string.format('\n\nCorrection applied on %d of %d. On the rest, switch Upright to '
+				.. 'Auto and back to Guided to apply it.', solved, #placedPhotos)
+		end
+	end
 
 	progress:done()
 
@@ -213,7 +327,8 @@ local function main(context)
 		shown[#shown + 1] = string.format('...and %d more', #lines - MAX_LISTED)
 	end
 	LrDialogs.message('Upright Guides',
-		string.format('Guides placed on %d of %d photo(s).\n\n%s', placed, #photos, table.concat(shown, '\n')),
+		string.format('Guides placed on %d of %d photo(s).\n\n%s%s', placed, #photos,
+			table.concat(shown, '\n'), solveNote),
 		'info')
 end
 
